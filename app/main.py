@@ -1,95 +1,87 @@
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import io
-import unicodedata
 
 app = FastAPI()
 
-def normalizar(texto):
-    return (
-        texto.lower()
-        .replace(" ", "_")
-        .replace("(", "")
-        .replace(")", "")
-        .replace("á", "a")
-        .replace("é", "e")
-        .replace("í", "i")
-        .replace("ó", "o")
-        .replace("ú", "u")
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def normalizar_col(col):
+    return col.upper().strip()
 
 @app.post("/analizar")
 async def analizar_archivo(file: UploadFile = File(...)):
     try:
         content = await file.read()
+        # Tu archivo usa ";" como separador según el ejemplo
         df = pd.read_csv(io.StringIO(content.decode("utf-8")), sep=";")
+        
+        # Limpiar nombres de columnas
+        df.columns = [normalizar_col(c) for c in df.columns]
 
-        # Normalizar encabezados
-        df.columns = [normalizar(c) for c in df.columns]
+        analisis_pacientes = []
 
-        # Mapeo real según tu archivo
-        columnas = {
-            "edad": "edad",
-            "dx_confirmado_hta": "dx_confirmado_hta",
-            "dx_confirmado_dm": "dx_confirmado_dm",
-            "ldl": "ldl",
-            "imc": "imc"
-        }
-
-        for col in columnas.values():
-            if col not in df.columns:
-                return {
-                    "error": f"❌ Falta la columna requerida: {col}",
-                    "columnas_detectadas": list(df.columns)
-                }
-
-        # Limpieza de datos
-        df.replace(
-            ["SINDATO", "NO APLICA", "", " "],
-            pd.NA,
-            inplace=True
-        )
-
-        df["edad"] = pd.to_numeric(df["edad"], errors="coerce")
-        df["ldl"] = pd.to_numeric(df["ldl"], errors="coerce")
-        df["imc"] = pd.to_numeric(df["imc"], errors="coerce")
-
-        def calcular_riesgo(row):
+        for _, row in df.iterrows():
+            # Extracción de variables clave según tu estructura
+            edad = pd.to_numeric(row.get('EDAD'), errors='coerce')
+            ldl = pd.to_numeric(row.get('LDL'), errors='coerce')
+            imc = pd.to_numeric(row.get('IMC'), errors='coerce')
+            hta = str(row.get('DX CONFIRMADO HTA')).upper()
+            dm = str(row.get('DX CONFIRMADO DM')).upper()
+            tfg = pd.to_numeric(row.get('CREATININA SANGRE (MG/DL)'), errors='coerce') # Simplificado para el ejemplo
+            
+            # --- Lógica Médica de RCV ---
             score = 0
+            alertas = []
 
-            if row["edad"] and row["edad"] >= 60:
+            # 1. Evaluación de Comorbilidades
+            if hta == "SI": 
                 score += 2
-            if row["dx_confirmado_hta"] == "SI":
+                alertas.append("Diagnóstico de Hipertensión")
+            if dm == "SI": 
+                score += 3 # La diabetes es un multiplicador de riesgo mayor
+                alertas.append("Paciente Diabético (Alto Riesgo Metabólico)")
+            
+            # 2. Evaluación de Metas (LDL)
+            if ldl > 130:
                 score += 2
-            if row["dx_confirmado_dm"] == "SI":
-                score += 2
-            if row["ldl"] and row["ldl"] > 160:
-                score += 2
-            if row["imc"] and row["imc"] >= 30:
+                alertas.append(f"LDL fuera de metas ({ldl} mg/dl)")
+            elif ldl > 70 and dm == "SI":
+                alertas.append("LDL > 70 en diabético: Requiere ajuste de estatinas")
+
+            # 3. Obesidad e IMC
+            if imc >= 30:
                 score += 1
+                alertas.append(f"Obesidad Grado I+ (IMC: {imc})")
 
-            if score >= 6:
-                return "RIESGO ALTO"
-            elif score >= 3:
-                return "RIESGO MODERADO"
-            else:
-                return "RIESGO BAJO"
+            # 4. Clasificación Final
+            nivel = "BAJO"
+            if score >= 6 or dm == "SI": nivel = "ALTO"
+            elif score >= 3: nivel = "MODERADO"
 
-        df["riesgo"] = df.apply(calcular_riesgo, axis=1)
+            analisis_pacientes.append({
+                "nombre": f"{row.get('PRI NOMBRE')} {row.get('PRI APELLIDO')}",
+                "edad": edad,
+                "riesgo": nivel,
+                "alertas": alertas,
+                "sugerencia": "Iniciar estatinas de alta intensidad" if nivel == "ALTO" else "Seguimiento anual"
+            })
 
+        # Resumen estadístico para el Dashboard
         return {
             "status": "ok",
             "registros": len(df),
-            "riesgo_alto": int((df["riesgo"] == "RIESGO ALTO").sum()),
-            "riesgo_moderado": int((df["riesgo"] == "RIESGO MODERADO").sum()),
-            "riesgo_bajo": int((df["riesgo"] == "RIESGO BAJO").sum()),
-            "ejemplo": df[["edad", "dx_confirmado_hta", "dx_confirmado_dm", "ldl", "imc", "riesgo"]]
-                        .head(3)
-                        .to_dict(orient="records")
+            "riesgo_alto": len([p for p in analisis_pacientes if p['riesgo'] == "ALTO"]),
+            "riesgo_moderado": len([p for p in analisis_pacientes if p['riesgo'] == "MODERADO"]),
+            "riesgo_bajo": len([p for p in analisis_pacientes if p['riesgo'] == "BAJO"]),
+            "detalle_clinico": analisis_pacientes[:10] # Enviamos los primeros 10 con lujo de detalle
         }
 
     except Exception as e:
-        return {
-            "error": "Error al procesar archivo",
-            "detalle": str(e)
-        }
+        return {"error": str(e)}
