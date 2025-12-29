@@ -1,80 +1,80 @@
 from fastapi import FastAPI, UploadFile, File
 import pandas as pd
 import io
-import unicodedata
 
-app = FastAPI(title="Analizador Clínico RCV")
-
-def normalizar(texto):
-    if texto is None:
-        return ""
-    texto = unicodedata.normalize("NFD", texto)
-    texto = texto.encode("ascii", "ignore").decode("utf-8")
-    return texto.upper().replace(" ", "_")
+app = FastAPI(title="Analizador RCV Clínico")
 
 @app.post("/analizar")
 async def analizar_archivo(file: UploadFile = File(...)):
-
     try:
+        # Leer archivo CSV separado por ;
         content = await file.read()
+        df = pd.read_csv(io.StringIO(content.decode("utf-8")), sep=";")
 
-        df = pd.read_csv(
-            io.BytesIO(content),
-            sep=";",
-            encoding="latin1",
-            dtype=str
-        )
+        # Normalizar columnas
+        df.columns = df.columns.str.strip().str.upper()
 
-        # Normalizar nombres de columnas
-        df.columns = [normalizar(c) for c in df.columns]
+        # Limpieza básica
+        df.replace(["SINDATO", "NO APLICA", "NA", ""], pd.NA, inplace=True)
 
-        # --------- DETECCIÓN SEGURA DE COLUMNAS ---------
-        col_ht = next((c for c in df.columns if "DX_CONFIRMADO_HTA" in c), None)
-        col_dm = next((c for c in df.columns if "DX_CONFIRMADO_DM" in c), None)
-        col_rcv = next((c for c in df.columns if "CLASIFICACION_DEL_RCV" in c), None)
-        col_tfg = next((c for c in df.columns if "TFG" in c and "ACTUAL" in c), None)
-        col_imc = next((c for c in df.columns if c == "IMC"), None)
+        # Variables clínicas clave
+        columnas = [
+            "EDAD",
+            "SEXO",
+            "DX CONFIRMADO HTA",
+            "DX CONFIRMADO DM",
+            "TENSIÓN ARTERIAL SISTÓLICA AL INGRESO A BASE",
+            "TENSIÓN ARTERIAL DIASTÓLICA AL INGRESO A BASE",
+            "COLESTEROL TOTAL",
+            "LDL",
+            "IMC"
+        ]
 
-        # --------- ANÁLISIS CLÍNICO ---------
-        total = len(df)
+        df = df[columnas]
 
-        hipertensos = (df[col_ht] == "SI").sum() if col_ht else 0
-        diabeticos = (df[col_dm] == "SI").sum() if col_dm else 0
-        riesgo_alto = (df[col_rcv] == "RIESGO ALTO").sum() if col_rcv else 0
+        # Conversión numérica segura
+        for col in ["EDAD", "COLESTEROL TOTAL", "LDL", "IMC"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        erc = 0
-        if col_tfg:
-            df["TFG_NUM"] = pd.to_numeric(df[col_tfg], errors="coerce")
-            erc = (df["TFG_NUM"] < 60).sum()
+        # Clasificación de riesgo
+        def clasificar_riesgo(row):
+            riesgo = 0
 
-        obesidad = 0
-        if col_imc:
-            df["IMC_NUM"] = pd.to_numeric(df[col_imc], errors="coerce")
-            obesidad = (df["IMC_NUM"] >= 30).sum()
+            if row["EDAD"] >= 60:
+                riesgo += 2
+            if row["DX CONFIRMADO HTA"] == "SI":
+                riesgo += 2
+            if row["DX CONFIRMADO DM"] == "SI":
+                riesgo += 2
+            if row["LDL"] and row["LDL"] > 160:
+                riesgo += 2
+            if row["IMC"] and row["IMC"] >= 30:
+                riesgo += 1
+
+            if riesgo >= 6:
+                return "RIESGO ALTO"
+            elif riesgo >= 3:
+                return "RIESGO MODERADO"
+            else:
+                return "RIESGO BAJO"
+
+        df["RIESGO_CARDIOVASCULAR"] = df.apply(clasificar_riesgo, axis=1)
+
+        resumen = {
+            "total_pacientes": len(df),
+            "riesgo_alto": int((df["RIESGO_CARDIOVASCULAR"] == "RIESGO ALTO").sum()),
+            "riesgo_moderado": int((df["RIESGO_CARDIOVASCULAR"] == "RIESGO MODERADO").sum()),
+            "riesgo_bajo": int((df["RIESGO_CARDIOVASCULAR"] == "RIESGO BAJO").sum()),
+        }
 
         return {
-            "estado": "ok",
-            "archivo_procesado": file.filename,
-            "registros": total,
-            "analisis_clinico": {
-                "hipertensos": int(hipertensos),
-                "diabeticos": int(diabeticos),
-                "pacientes_con_erc": int(erc),
-                "obesidad": int(obesidad),
-                "riesgo_cardiovascular_alto": int(riesgo_alto)
-            },
-            "interpretacion": [
-                "Alta carga de enfermedad cardiovascular",
-                "Presencia significativa de HTA y DM",
-                "Casos con deterioro de función renal",
-                "Necesidad de seguimiento clínico continuo"
-            ],
-            "observacion": "El análisis es descriptivo. No se modifican los datos originales."
+            "status": "ok",
+            "resumen": resumen,
+            "muestra_resultados": df.head(5).to_dict(orient="records")
         }
 
     except Exception as e:
         return {
-            "estado": "error",
-            "mensaje": "Error procesando el archivo",
-            "detalle_tecnico": str(e)
+            "status": "error",
+            "detalle": str(e)
         }
