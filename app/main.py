@@ -2,79 +2,97 @@ from fastapi import FastAPI, UploadFile, File
 import pandas as pd
 import io
 
-app = FastAPI(title="Analizador RCV Clínico")
+app = FastAPI(title="Motor Clínico RCV")
 
 @app.post("/analizar")
 async def analizar_archivo(file: UploadFile = File(...)):
+
     try:
-        # Leer archivo CSV separado por ;
+        # =========================
+        # LECTURA DEL ARCHIVO
+        # =========================
         content = await file.read()
-        df = pd.read_csv(io.StringIO(content.decode("utf-8")), sep=";")
+        df = pd.read_csv(
+            io.StringIO(content.decode("utf-8")),
+            sep=";",
+            dtype=str
+        )
 
-        # Normalizar columnas
-        df.columns = df.columns.str.strip().str.upper()
+        # =========================
+        # LIMPIEZA DE DATOS
+        # =========================
+        df.replace(["SINDATO", "NO APLICA", "", " "], pd.NA, inplace=True)
 
-        # Limpieza básica
-        df.replace(["SINDATO", "NO APLICA", "NA", ""], pd.NA, inplace=True)
-
-        # Variables clínicas clave
-        columnas = [
+        # Conversión de campos numéricos
+        campos_numericos = [
             "EDAD",
-            "SEXO",
-            "DX CONFIRMADO HTA",
-            "DX CONFIRMADO DM",
-            "TENSIÓN ARTERIAL SISTÓLICA AL INGRESO A BASE",
-            "TENSIÓN ARTERIAL DIASTÓLICA AL INGRESO A BASE",
-            "COLESTEROL TOTAL",
+            "IMC",
             "LDL",
-            "IMC"
+            "COLESTEROL TOTAL",
+            "TFG fórmula Cockcroft and Gault Actual"
         ]
 
-        df = df[columnas]
+        for col in campos_numericos:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Conversión numérica segura
-        for col in ["EDAD", "COLESTEROL TOTAL", "LDL", "IMC"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # =========================
+        # INDICADORES CLÍNICOS
+        # =========================
+        total = len(df)
 
-        # Clasificación de riesgo
-        def clasificar_riesgo(row):
-            riesgo = 0
+        hta = (df["DX CONFIRMADO HTA"] == "SI").sum()
+        dm = (df["DX CONFIRMADO DM"] == "SI").sum()
+        obesos = (df["IMC"] >= 30).sum()
+        dislipidemia = (df["LDL"] >= 160).sum()
+        erc = (df["TFG fórmula Cockcroft and Gault Actual"] < 60).sum()
 
-            if row["EDAD"] >= 60:
-                riesgo += 2
-            if row["DX CONFIRMADO HTA"] == "SI":
-                riesgo += 2
-            if row["DX CONFIRMADO DM"] == "SI":
-                riesgo += 2
-            if row["LDL"] and row["LDL"] > 160:
-                riesgo += 2
-            if row["IMC"] and row["IMC"] >= 30:
-                riesgo += 1
+        # =========================
+        # CÁLCULO DE RIESGO CV
+        # =========================
+        def calcular_riesgo(row):
+            score = 0
+            if row.get("EDAD", 0) >= 60: score += 2
+            if row.get("DX CONFIRMADO HTA") == "SI": score += 2
+            if row.get("DX CONFIRMADO DM") == "SI": score += 2
+            if row.get("LDL", 0) and row["LDL"] >= 160: score += 2
+            if row.get("IMC", 0) and row["IMC"] >= 30: score += 1
 
-            if riesgo >= 6:
+            if score >= 6:
                 return "RIESGO ALTO"
-            elif riesgo >= 3:
+            elif score >= 3:
                 return "RIESGO MODERADO"
             else:
                 return "RIESGO BAJO"
 
-        df["RIESGO_CARDIOVASCULAR"] = df.apply(clasificar_riesgo, axis=1)
+        df["RIESGO_CV"] = df.apply(calcular_riesgo, axis=1)
 
-        resumen = {
-            "total_pacientes": len(df),
-            "riesgo_alto": int((df["RIESGO_CARDIOVASCULAR"] == "RIESGO ALTO").sum()),
-            "riesgo_moderado": int((df["RIESGO_CARDIOVASCULAR"] == "RIESGO MODERADO").sum()),
-            "riesgo_bajo": int((df["RIESGO_CARDIOVASCULAR"] == "RIESGO BAJO").sum()),
+        # =========================
+        # RESULTADOS
+        # =========================
+        resultado = {
+            "poblacion_total": int(total),
+            "hipertensos": int(hta),
+            "diabeticos": int(dm),
+            "obesidad": int(obesos),
+            "dislipidemia": int(dislipidemia),
+            "enfermedad_renal": int(erc),
+            "riesgo_alto": int((df["RIESGO_CV"] == "RIESGO ALTO").sum()),
+            "riesgo_moderado": int((df["RIESGO_CV"] == "RIESGO MODERADO").sum()),
+            "riesgo_bajo": int((df["RIESGO_CV"] == "RIESGO BAJO").sum()),
+            "interpretacion_clinica": [
+                "Alta carga de enfermedad cardiovascular",
+                "Presencia significativa de HTA y Diabetes",
+                "Riesgo renal relevante en la población",
+                "Necesidad de control metabólico estricto",
+                "Seguimiento prioritario a pacientes de alto riesgo"
+            ]
         }
 
-        return {
-            "status": "ok",
-            "resumen": resumen,
-            "muestra_resultados": df.head(5).to_dict(orient="records")
-        }
+        return resultado
 
     except Exception as e:
         return {
-            "status": "error",
+            "error": "Error al procesar el archivo",
             "detalle": str(e)
         }
