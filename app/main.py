@@ -4,16 +4,15 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
-from pypdf import PdfReader
 from dotenv import load_dotenv
 
-# Cargar variables de entorno (API Key)
+# 1. Cargar variables de entorno
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="API de Análisis de Riesgo Cardiovascular")
 
-# Configuración de OpenAI
-# Asegúrate de tener OPENAI_API_KEY en tus variables de entorno o archivo .env
+# 2. Configuración de OpenAI
+# Recuerda configurar OPENAI_API_KEY en el dashboard de Render -> Environment
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app.add_middleware(
@@ -23,23 +22,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- FUNCIÓN PARA BASE DE CONOCIMIENTO (PDF) ---
-def extraer_conocimiento_pdf(ruta_pdf="base_conocimiento.pdf"):
-    """Extrae el texto del PDF para usarlo como contexto en GPT"""
+# --- 3. FUNCIÓN PARA CARGAR BASE DE CONOCIMIENTO OPTIMIZADA (.txt) ---
+def cargar_conocimiento_txt(ruta_txt="base_conocimiento.txt"):
+    """
+    Carga los indicadores técnicos de RCV desde un archivo de texto.
+    Esto es más eficiente que procesar un PDF completo en cada ejecución.
+    """
     try:
-        if not os.path.exists(ruta_pdf):
-            return "No se encontró el archivo de referencia médica."
+        if not os.path.exists(ruta_txt):
+            print(f"⚠️ Alerta: No se encontró {ruta_txt}. La IA usará conocimiento general.")
+            return "Guía básica: Priorizar control de HTA y Diabetes según protocolos estándar."
         
-        reader = PdfReader(ruta_pdf)
-        texto = ""
-        for page in reader.pages:
-            texto += page.extract_text()
-        return texto
+        with open(ruta_txt, "r", encoding="utf-8") as f:
+            return f.read()
     except Exception as e:
-        return f"Error leyendo PDF: {str(e)}"
+        return f"Error leyendo base de conocimiento: {str(e)}"
 
-# Cargamos el PDF en memoria al iniciar la API
-CONOCIMIENTO_MEDICO = extraer_conocimiento_pdf()
+# Cargamos el conocimiento filtrado en memoria al iniciar la API
+CONOCIMIENTO_MEDICO = cargar_conocimiento_txt()
 
 def normalizar_columna(col):
     return str(col).upper().strip()
@@ -49,18 +49,20 @@ async def analizar_archivo(file: UploadFile = File(...)):
     try:
         content = await file.read()
         
+        # Manejo de codificación del CSV
         try:
             decoded_content = content.decode("utf-8")
         except UnicodeDecodeError:
             decoded_content = content.decode("latin-1")
             
+        # Lectura del DataFrame (usando punto y coma como separador)
         df = pd.read_csv(io.StringIO(decoded_content), sep=";")
         df.columns = [normalizar_columna(c) for c in df.columns]
 
         resultados = []
         
         for _, row in df.iterrows():
-            nombre = f"{row.get('PRI NOMBRE', '')} {row.get('PRI APELLIDO', '')}"
+            nombre = f"{row.get('PRI NOMBRE', '')} {row.get('PRI APELLIDO', '')}".strip()
             edad = pd.to_numeric(row.get('EDAD'), errors='coerce')
             ldl = pd.to_numeric(row.get('LDL'), errors='coerce')
             imc = pd.to_numeric(row.get('IMC'), errors='coerce')
@@ -70,6 +72,7 @@ async def analizar_archivo(file: UploadFile = File(...)):
             puntos = 0
             alertas = []
             
+            # --- Lógica de Riesgo (Score RCV) ---
             if pd.notna(edad) and edad >= 60:
                 puntos += 2
                 alertas.append("Edad ≥ 60 años")
@@ -95,46 +98,58 @@ async def analizar_archivo(file: UploadFile = File(...)):
                 puntos += 1
                 alertas.append(f"Obesidad (IMC: {imc})")
 
+            # Clasificación de Nivel
             nivel = "BAJO"
             if puntos >= 6 or es_diabetico:
                 nivel = "ALTO"
             elif puntos >= 3:
                 nivel = "MODERADO"
 
-            # --- INTEGRACIÓN OPCIONAL CON GPT POR PACIENTE ---
-            # Si el riesgo es alto, podemos pedir una sugerencia personalizada a la IA
+            # --- 4. CONSULTA A LA IA (Solo para Riesgo ALTO) ---
             resumen_ia = ""
             if nivel == "ALTO":
-                prompt_ia = f"Paciente: {nombre}, Edad: {edad}, HTA: {hta}, DM: {dm}, LDL: {ldl}. Guía médica: {CONOCIMIENTO_MEDICO[:2000]}"
-                # Limitamos el texto del PDF a los primeros 2000 caracteres para no gastar tokens excesivos
+                # Creamos el contexto para la IA usando el TXT cargado
+                prompt_ia = (
+                    f"Paciente: {nombre}, Edad: {edad}, HTA: {hta}, DM: {dm}, LDL: {ldl}, IMC: {imc}. "
+                    f"Contexto técnico de indicadores RCV: {CONOCIMIENTO_MEDICO}"
+                )
                 
                 try:
                     response = client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[
-                            {"role": "system", "content": "Eres un cardiólogo experto. Da una recomendación breve basada en la guía proporcionada."},
+                            {
+                                "role": "system", 
+                                "content": "Eres un cardiólogo experto. Da una recomendación médica brevísima (máx 3 frases) "
+                                           "basada estrictamente en los indicadores de calidad RCV proporcionados."
+                            },
                             {"role": "user", "content": prompt_ia}
                         ],
-                        max_tokens=150
+                        max_tokens=150,
+                        temperature=0.5
                     )
                     resumen_ia = response.choices[0].message.content
-                except:
-                    resumen_ia = "Consulta IA no disponible"
+                except Exception:
+                    resumen_ia = "Sugerencia: Priorizar Medicina Interna y control estricto de metas."
 
             resultados.append({
                 "nombre": nombre,
                 "edad": int(edad) if pd.notna(edad) else 0,
                 "riesgo": nivel,
                 "alertas": alertas,
-                "sugerencia_ia": resumen_ia if resumen_ia else ("Priorizar Medicina Interna" if nivel == "ALTO" else "Seguimiento Preventivo")
+                "sugerencia_ia": resumen_ia if resumen_ia else ("Seguimiento preventivo" if nivel != "ALTO" else "Priorizar Medicina Interna")
             })
 
         return {
             "status": "ok",
-            "registros": len(df),
-            "riesgo_alto": len([p for p in resultados if p['riesgo'] == "ALTO"]),
-            "detalle_clinico": resultados[:50] # Reducido a 50 para optimizar respuesta
+            "registros_procesados": len(df),
+            "total_riesgo_alto": len([p for p in resultados if p['riesgo'] == "ALTO"]),
+            "detalle_clinico": resultados[:50]  # Limite para evitar saturar la respuesta JSON
         }
 
     except Exception as e:
-        return {"error": "Error crítico al procesar", "detalle": str(e)}
+        return {"status": "error", "mensaje": "Error crítico al procesar el archivo", "detalle": str(e)}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
