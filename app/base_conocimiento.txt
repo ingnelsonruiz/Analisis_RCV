@@ -1,0 +1,36 @@
+INDICADORES DE RIESGO CARDIOVASCULAR (RESOLUCIÓN 0256 DE 2016)
+
+1. PREVALENCIA DE HIPERTENSIÓN ARTERIAL (Código: D.1.11)
+- Definición: Número de personas diagnosticadas con HTA respecto al total de la población[cite: 5, 46].
+- Cálculo: (Personas con diagnóstico de HTA / Población total) * 100[cite: 5, 47].
+- Fuente: SISPRO - Cuenta de Alto Costo[cite: 5, 48].
+
+2. CAPTACIÓN DE HIPERTENSIÓN ARTERIAL (18 a 69 años) (Código: E.2.5)
+- Definición: Proporción de casos captados vs casos esperados con diagnóstico de HTA en este grupo de edad[cite: 5, 101].
+- Cálculo: (Pacientes con HTA reportados / Total esperado de personas con HTA) * 100[cite: 5, 102].
+
+3. CONTROL DE PACIENTES HIPERTENSOS (Código: E.2.6)
+- Definición: Proporción de personas con HTA que mantienen niveles de presión arterial bajo control según guías clínicas[cite: 5, 346].
+
+4. MEDICIÓN DE LDL EN PACIENTES CON HTA (Código: P.1.14)
+- Definición: Personas con HTA a quienes se les realizó como mínimo una medida de LDL en el año[cite: 6, 153].
+- Cálculo: (Pacientes con HTA y medición de LDL / Total de personas con HTA) * 100[cite: 6, 153].
+- Observación: Aplica para pacientes en atención por al menos un año[cite: 6, 156].
+
+5. PREVALENCIA DE DIABETES MELLITUS (Código: D.1.12)
+- Definición: Número de personas diagnosticadas con Diabetes Mellitus respecto al total de la población[cite: 5, 285].
+
+6. CONTROL DE PACIENTES DIABÉTICOS (Código: E.2.8)
+- Definición: Proporción de pacientes con diabetes que cumplen con las metas de control (ej. Hemoglobina Glicosilada)[cite: 5, 350].
+
+7. TOMA DE HEMOGLOBINA GLICOSILADA (HbA1c) (Código: P.1.15)
+- Definición: Proporción de pacientes con Diabetes Mellitus a quienes se les realizó toma de HbA1c en el último semestre[cite: 6, 159].
+- Cálculo: (Diabéticos con toma de HbA1c / Total de diabéticos reportados) * 100[cite: 6, 160].
+
+8. ESTUDIO PARA ENFERMEDAD RENAL CRÓNICA (ERC) (Códigos: P.1.17 y P.1.18)
+- Definición: Proporción de personas con HTA o Diabetes estudiadas para detectar ERC[cite: 6, 423, 425].
+- Importancia: Evalúa la prevención secundaria de daño de órgano blanco[cite: 6, 423].
+
+9. TIEMPO DE ESPERA PARA CIRUGÍA DE REVASCULARIZACIÓN MIOCÁRDICA (Códigos: E.3.6 y P.3.13)
+- Definición: Días calendario entre la solicitud y la autorización/realización de la cirugía[cite: 6, 119, 7, 498].
+- Contexto: Indicador crítico para pacientes con riesgo RCV muy alto que requieren intervención quirúrgica[cite: 6, 382].
