@@ -7,8 +7,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
-
-app = FastAPI(title="CardioCheck AI Backend")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,106 +18,111 @@ app.add_middleware(
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- NUEVA FUNCIÓN: CARGAR CONOCIMIENTO ---
-def obtener_contexto_normativo():
-    ruta = "app/base_conocimiento.txt"
-    if os.path.exists(ruta):
-        with open(ruta, "r", encoding="utf-8") as f:
-            return f.read()
-    return "No hay guías adicionales cargadas."
-
 @app.post("/analizar")
 async def analizar_archivo(file: UploadFile = File(...)):
     try:
         content = await file.read()
         try:
-            decoded_content = content.decode("utf-8")
+            decoded = content.decode("utf-8")
         except:
-            decoded_content = content.decode("latin-1")
+            decoded = content.decode("latin-1")
             
-        df = pd.read_csv(io.StringIO(decoded_content), sep=";")
-        df.columns = [str(c).upper().strip() for c in df.columns]
+        # Leer el CSV con separador punto y coma
+        df = pd.read_csv(io.StringIO(decoded), sep=";")
+        df.columns = [c.strip() for c in df.columns]
 
-        # 1. LIMPIEZA DE DATOS (Se mantiene igual)
-        df['TAS'] = pd.to_numeric(df.get('TENSIÓN ARTERIAL SISTÓLICA AL INGRESO A BASE'), errors='coerce')
-        df['TAD'] = pd.to_numeric(df.get('TENSIÓN ARTERIAL DIASTÓLICA AL INGRESO A BASE'), errors='coerce')
-        df['HBA1C'] = pd.to_numeric(df.get('HEMOGLOBINA GLICOSILADA (HBA1C)'), errors='coerce')
-        df['TFG'] = pd.to_numeric(df.get('TFG fOrmula Cockcroft and Gault Actual'), errors='coerce')
-        df['LDL'] = pd.to_numeric(df.get('LDL'), errors='coerce')
-        df['EDAD'] = pd.to_numeric(df.get('EDAD'), errors='coerce')
+        # --- PROCESAMIENTO DE DATOS CLÍNICOS ---
+        
+        # Función para limpiar números (ej: '130,5' -> 130.5)
+        def clean_num(col):
+            if col in df.columns:
+                return pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
+            return pd.Series([0.0] * len(df))
 
-        # 2. LÓGICA DE CLASIFICACIÓN
-        def evaluar_riesgo(row):
+        # Variables clave según tu estructura
+        tas_final = clean_num('ÚLTIMA TENSIÓN ARTERIAL SISTOLICA')
+        tad_final = clean_num('ÚLTIMA TENSIÓN ARTERIAL DIASTÓLICA')
+        hba1c = clean_num('REPORTE DE HEMOGLOBINA GLICOSILADA (SOLO PARA USUARIOS CON DX DE DM)')
+        tfg = clean_num('TFG fórmula Cockcroft and Gault Actual')
+        ldl = clean_num('LDL')
+        
+        # Conteos de Diagnóstico
+        tiene_hta = df['DX CONFIRMADO HTA'].str.upper().str.contains('SI', na=False).sum()
+        tiene_dm = df['DX CONFIRMADO DM'].str.upper().str.contains('SI', na=False).sum()
+
+        # --- LÓGICA DE RIESGO ---
+        riesgo_alto = 0
+        riesgo_mod = 0
+        riesgo_bajo = 0
+        pacientes_prioritarios = []
+
+        for idx, row in df.iterrows():
             alertas = []
-            score = 0
-            if row['TAS'] >= 140 or row['TAD'] >= 90:
-                alertas.append("HTA DESCONTROLADA"); score += 2
-            if row['HBA1C'] >= 7.0:
-                alertas.append("DM DESCOMPENSADA"); score += 2
-            if row['TFG'] < 60:
-                alertas.append("FALLA RENAL E3+"); score += 3
-            if row['LDL'] > 100:
-                alertas.append("DISLIPIDEMIA"); score += 1
+            
+            # Regla 1: Descontrol Tensional (Basado en la última toma)
+            if tas_final[idx] >= 140 or tad_final[idx] >= 90:
+                alertas.append("HTA DESCONTROLADA")
+            
+            # Regla 2: Descontrol Glucémico
+            if row['DX CONFIRMADO DM'] == 'SI' and hba1c[idx] >= 7.0:
+                alertas.append("DM NO CONTROLADA")
+            
+            # Regla 3: Función Renal Comprometida
+            if 0 < tfg[idx] < 60:
+                alertas.append(f"ERC ESTADIO 3+ ({tfg[idx]})")
 
-            riesgo = "ALTO" if (score >= 4 or row['EDAD'] >= 70) else "MODERADO" if score >= 2 else "BAJO"
-            return pd.Series([riesgo, alertas])
+            # Clasificación de Riesgo para el Dashboard
+            if len(alertas) >= 2 or tfg[idx] < 30 or row['CLASIFICACION DEL RCV ACTUAL'] == 'RIESGO ALTO':
+                riesgo = "ALTO"; riesgo_alto += 1
+            elif len(alertas) == 1 or row['CLASIFICACION DEL RCV ACTUAL'] == 'RIESGO MODERADO':
+                riesgo = "MODERADO"; riesgo_mod += 1
+            else:
+                riesgo = "BAJO"; riesgo_bajo += 1
 
-        df[['RIESGO_CAT', 'ALERTAS_LIST']] = df.apply(evaluar_riesgo, axis=1)
+            # Agregar a tabla de intervención (Top 20 críticos)
+            if (riesgo == "ALTO" or riesgo == "MODERADO") and len(pacientes_prioritarios) < 20:
+                nombre_completo = f"{row['PRI NOMBRE']} {row['PRI APELLIDO']}"
+                pacientes_prioritarios.append({
+                    "nombre": nombre_completo,
+                    "edad": str(row['EDAD']),
+                    "riesgo": riesgo,
+                    "alertas": alertas,
+                    "sugerencia": "Revisión de terapia farmacológica urgente."
+                })
 
-        # 3. CONSTRUCCIÓN DE ESTADÍSTICAS PARA EL PROMPT
-        total_pob = len(df)
-        counts = df['RIESGO_CAT'].value_counts()
+        # --- RESUMEN PARA LA IA ---
+        # Calculamos los promedios antes para que la IA tenga datos reales
+        hba1c_media = hba1c[hba1c > 0].mean()
+        ldl_media = ldl[ldl > 0].mean()
+
+        informe_para_ia = f"""
+        Resultados Cohorte IPSI KANKUAMA:
+        - Total Pacientes: {len(df)}
+        - Diagnóstico HTA: {tiene_hta} pacientes.
+        - Diagnóstico DM: {tiene_dm} pacientes.
+        - Promedio HbA1c: {hba1c_media:.2f}%
+        - Promedio LDL: {ldl_media:.2f} mg/dL
+        - Pacientes con TFG < 60: {(tfg < 60).sum()}
         
-        # --- NUEVO: CARGA DE BASE DE CONOCIMIENTO ---
-        conocimiento_medico = obtener_contexto_normativo()
+        Analiza estos datos frente a la Resolución 0256 y da recomendaciones.
+        """
 
-        # 4. LLAMADA A IA CON RAG (Retrieval Augmented Generation) BÁSICO
-        prompt_ia = (
-            f"DATOS DE LA COHORTE:\n"
-            f"- Total: {total_pob} pacientes.\n"
-            f"- Riesgo Alto: {counts.get('ALTO', 0)}\n"
-            f"- Riesgo Moderado: {counts.get('MODERADO', 0)}\n"
-            f"- Promedio HbA1c: {df['HBA1C'].mean():.2f}\n"
-            f"- Pacientes con Falla Renal detectada: {len(df[df['TFG'] < 60])}\n"
-        )
-        
-        res_ia = client.chat.completions.create(
+        response_ia = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system", 
-                    "content": (
-                        "Eres un Director Médico experto en Riesgo Cardiovascular y auditoría de la Resolución 0256 de Colombia. "
-                        "Utiliza la siguiente BASE DE CONOCIMIENTO para contrastar los resultados de la cohorte y dar recomendaciones legales y clínicas:\n\n"
-                        f"### BASE DE CONOCIMIENTO NORMARTIVA:\n{conocimiento_medico}"
-                    )
-                },
-                {"role": "user", "content": prompt_ia}
-            ],
-            max_tokens=500
+                {"role": "system", "content": "Eres un Director Médico experto en auditoría de la Resolución 0256 en Colombia."},
+                {"role": "user", "content": informe_para_ia}
+            ]
         )
 
-        # 5. ESTRUCTURA DE RETORNO (Sincronizada con tu HTML)
-        detalle_clinico = []
-        df_criticos = df[df['RIESGO_CAT'] == "ALTO"].head(20)
-        for _, r in df_criticos.iterrows():
-            detalle_clinico.append({
-                "nombre": f"{r.get('PRI NOMBRE', '')} {r.get('PRI APELLIDO', '')}",
-                "edad": int(r['EDAD']) if not pd.isna(r['EDAD']) else 0,
-                "riesgo": r['RIESGO_CAT'],
-                "alertas": r['ALERTAS_LIST'],
-                "sugerencia": "Priorizar cita por Medicina Interna según protocolo."
-            })
-
         return {
-            "status": "ok",
-            "registros": total_pob,
-            "riesgo_alto": int(counts.get("ALTO", 0)),
-            "riesgo_moderado": int(counts.get("MODERADO", 0)),
-            "riesgo_bajo": int(counts.get("BAJO", 0)),
-            "detalle_clinico": detalle_clinico,
-            "analisis_ia": res_ia.choices[0].message.content
+            "registros": len(df),
+            "riesgo_alto": riesgo_alto,
+            "riesgo_moderado": riesgo_mod,
+            "riesgo_bajo": riesgo_bajo,
+            "detalle_clinico": pacientes_prioritarios,
+            "analisis_ia": response_ia.choices[0].message.content
         }
 
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Error procesando el CSV: {str(e)}"}
