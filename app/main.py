@@ -1,11 +1,21 @@
+import os
+import io
+import pandas as pd
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import io
+from openai import OpenAI
+from pypdf import PdfReader
+from dotenv import load_dotenv
+
+# Cargar variables de entorno (API Key)
+load_dotenv()
 
 app = FastAPI()
 
-# Habilitar CORS para que tu frontend en Vercel pueda comunicarse sin bloqueos
+# Configuración de OpenAI
+# Asegúrate de tener OPENAI_API_KEY en tus variables de entorno o archivo .env
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,8 +23,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- FUNCIÓN PARA BASE DE CONOCIMIENTO (PDF) ---
+def extraer_conocimiento_pdf(ruta_pdf="base_conocimiento.pdf"):
+    """Extrae el texto del PDF para usarlo como contexto en GPT"""
+    try:
+        if not os.path.exists(ruta_pdf):
+            return "No se encontró el archivo de referencia médica."
+        
+        reader = PdfReader(ruta_pdf)
+        texto = ""
+        for page in reader.pages:
+            texto += page.extract_text()
+        return texto
+    except Exception as e:
+        return f"Error leyendo PDF: {str(e)}"
+
+# Cargamos el PDF en memoria al iniciar la API
+CONOCIMIENTO_MEDICO = extraer_conocimiento_pdf()
+
 def normalizar_columna(col):
-    """Limpia encabezados para que coincidan sin importar espacios o tildes"""
     return str(col).upper().strip()
 
 @app.post("/analizar")
@@ -22,22 +49,17 @@ async def analizar_archivo(file: UploadFile = File(...)):
     try:
         content = await file.read()
         
-        # SOLUCIÓN AL ERROR 0xd3: Intentar Latin-1 para archivos de Excel/Spanish
         try:
             decoded_content = content.decode("utf-8")
         except UnicodeDecodeError:
             decoded_content = content.decode("latin-1")
             
-        # Lectura con separador punto y coma (;) como viene en tu ejemplo
         df = pd.read_csv(io.StringIO(decoded_content), sep=";")
-        
-        # Estandarizar nombres de columnas
         df.columns = [normalizar_columna(c) for c in df.columns]
 
         resultados = []
         
         for _, row in df.iterrows():
-            # Extracción de datos según tu estructura exacta
             nombre = f"{row.get('PRI NOMBRE', '')} {row.get('PRI APELLIDO', '')}"
             edad = pd.to_numeric(row.get('EDAD'), errors='coerce')
             ldl = pd.to_numeric(row.get('LDL'), errors='coerce')
@@ -45,29 +67,23 @@ async def analizar_archivo(file: UploadFile = File(...)):
             hta = str(row.get('DX CONFIRMADO HTA')).upper().strip()
             dm = str(row.get('DX CONFIRMADO DM')).upper().strip()
             
-            # --- Lógica Médica Avanzada ---
             puntos = 0
             alertas = []
             
-            # 1. Criterio Edad (Adulto Mayor)
             if pd.notna(edad) and edad >= 60:
                 puntos += 2
                 alertas.append("Edad ≥ 60 años")
 
-            # 2. Comorbilidad HTA
             if hta == "SI":
                 puntos += 2
                 alertas.append("Diagnóstico HTA")
                 
-            # 3. Comorbilidad Diabetes (Criterio de Alto Riesgo Automático)
             es_diabetico = (dm == "SI")
             if es_diabetico:
                 puntos += 3
                 alertas.append("Paciente Diabético")
                 
-            # 4. Dislipidemia (LDL fuera de metas)
             if pd.notna(ldl):
-                # Meta estricta para diabéticos (< 70) o general (> 130)
                 if es_diabetico and ldl > 70:
                     puntos += 2
                     alertas.append(f"LDL fuera de meta DM ({ldl} mg/dl)")
@@ -75,35 +91,49 @@ async def analizar_archivo(file: UploadFile = File(...)):
                     puntos += 2
                     alertas.append(f"LDL Elevado ({ldl} mg/dl)")
                 
-            # 5. Estado Nutricional (IMC)
-            # Manejamos "SINDATO" convirtiéndolo a nulo
             if pd.notna(imc) and imc >= 30:
                 puntos += 1
                 alertas.append(f"Obesidad (IMC: {imc})")
 
-            # Clasificación Final de Riesgo
             nivel = "BAJO"
             if puntos >= 6 or es_diabetico:
                 nivel = "ALTO"
             elif puntos >= 3:
                 nivel = "MODERADO"
 
+            # --- INTEGRACIÓN OPCIONAL CON GPT POR PACIENTE ---
+            # Si el riesgo es alto, podemos pedir una sugerencia personalizada a la IA
+            resumen_ia = ""
+            if nivel == "ALTO":
+                prompt_ia = f"Paciente: {nombre}, Edad: {edad}, HTA: {hta}, DM: {dm}, LDL: {ldl}. Guía médica: {CONOCIMIENTO_MEDICO[:2000]}"
+                # Limitamos el texto del PDF a los primeros 2000 caracteres para no gastar tokens excesivos
+                
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "Eres un cardiólogo experto. Da una recomendación breve basada en la guía proporcionada."},
+                            {"role": "user", "content": prompt_ia}
+                        ],
+                        max_tokens=150
+                    )
+                    resumen_ia = response.choices[0].message.content
+                except:
+                    resumen_ia = "Consulta IA no disponible"
+
             resultados.append({
                 "nombre": nombre,
                 "edad": int(edad) if pd.notna(edad) else 0,
                 "riesgo": nivel,
                 "alertas": alertas,
-                "sugerencia": "Priorizar Medicina Interna / Estatinas" if nivel == "ALTO" else "Seguimiento Preventivo"
+                "sugerencia_ia": resumen_ia if resumen_ia else ("Priorizar Medicina Interna" if nivel == "ALTO" else "Seguimiento Preventivo")
             })
 
-        # Resumen para el Frontend
         return {
             "status": "ok",
             "registros": len(df),
             "riesgo_alto": len([p for p in resultados if p['riesgo'] == "ALTO"]),
-            "riesgo_moderado": len([p for p in resultados if p['riesgo'] == "MODERADO"]),
-            "riesgo_bajo": len([p for p in resultados if p['riesgo'] == "BAJO"]),
-            "detalle_clinico": resultados[:100] # Enviamos los primeros 100 pacientes
+            "detalle_clinico": resultados[:50] # Reducido a 50 para optimizar respuesta
         }
 
     except Exception as e:
