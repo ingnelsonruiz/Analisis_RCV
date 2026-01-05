@@ -10,7 +10,6 @@ load_dotenv()
 
 app = FastAPI(title="CardioCheck AI Backend")
 
-# Habilitar CORS para que el HTML se comunique sin bloqueos
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,11 +19,18 @@ app.add_middleware(
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# --- NUEVA FUNCIÓN: CARGAR CONOCIMIENTO ---
+def obtener_contexto_normativo():
+    ruta = "app/base_conocimiento.txt"
+    if os.path.exists(ruta):
+        with open(ruta, "r", encoding="utf-8") as f:
+            return f.read()
+    return "No hay guías adicionales cargadas."
+
 @app.post("/analizar")
 async def analizar_archivo(file: UploadFile = File(...)):
     try:
         content = await file.read()
-        # Decodificación para archivos CSV de Excel (comunes en IPS)
         try:
             decoded_content = content.decode("utf-8")
         except:
@@ -33,77 +39,77 @@ async def analizar_archivo(file: UploadFile = File(...)):
         df = pd.read_csv(io.StringIO(decoded_content), sep=";")
         df.columns = [str(c).upper().strip() for c in df.columns]
 
-        # 1. LIMPIEZA Y CONVERSIÓN DE COLUMNAS CLÍNICAS
+        # 1. LIMPIEZA DE DATOS (Se mantiene igual)
         df['TAS'] = pd.to_numeric(df.get('TENSIÓN ARTERIAL SISTÓLICA AL INGRESO A BASE'), errors='coerce')
         df['TAD'] = pd.to_numeric(df.get('TENSIÓN ARTERIAL DIASTÓLICA AL INGRESO A BASE'), errors='coerce')
         df['HBA1C'] = pd.to_numeric(df.get('HEMOGLOBINA GLICOSILADA (HBA1C)'), errors='coerce')
         df['TFG'] = pd.to_numeric(df.get('TFG fOrmula Cockcroft and Gault Actual'), errors='coerce')
         df['LDL'] = pd.to_numeric(df.get('LDL'), errors='coerce')
         df['EDAD'] = pd.to_numeric(df.get('EDAD'), errors='coerce')
-        df['IMC'] = pd.to_numeric(df.get('IMC'), errors='coerce')
 
-        # 2. LÓGICA DE CLASIFICACIÓN (Para el Donut Chart y la Tabla)
+        # 2. LÓGICA DE CLASIFICACIÓN
         def evaluar_riesgo(row):
             alertas = []
             score = 0
-            
-            # Criterios de Riesgo / Alertas
             if row['TAS'] >= 140 or row['TAD'] >= 90:
-                alertas.append("HTA DESCONTROLADA")
-                score += 2
+                alertas.append("HTA DESCONTROLADA"); score += 2
             if row['HBA1C'] >= 7.0:
-                alertas.append("DM DESCOMPENSADA")
-                score += 2
+                alertas.append("DM DESCOMPENSADA"); score += 2
             if row['TFG'] < 60:
-                alertas.append("FALLA RENAL E3+")
-                score += 3
+                alertas.append("FALLA RENAL E3+"); score += 3
             if row['LDL'] > 100:
-                alertas.append("DISLIPIDEMIA")
-                score += 1
+                alertas.append("DISLIPIDEMIA"); score += 1
 
-            # Clasificación Final
-            if score >= 4 or row['EDAD'] >= 70: riesgo = "ALTO"
-            elif score >= 2: riesgo = "MODERADO"
-            else: riesgo = "BAJO"
-            
+            riesgo = "ALTO" if (score >= 4 or row['EDAD'] >= 70) else "MODERADO" if score >= 2 else "BAJO"
             return pd.Series([riesgo, alertas])
 
         df[['RIESGO_CAT', 'ALERTAS_LIST']] = df.apply(evaluar_riesgo, axis=1)
 
-        # 3. CONSTRUCCIÓN DE RESPUESTA PARA EL FRONTEND
+        # 3. CONSTRUCCIÓN DE ESTADÍSTICAS PARA EL PROMPT
         total_pob = len(df)
         counts = df['RIESGO_CAT'].value_counts()
         
-        # Detalle para la tabla (Top 20 pacientes con más alertas)
+        # --- NUEVO: CARGA DE BASE DE CONOCIMIENTO ---
+        conocimiento_medico = obtener_contexto_normativo()
+
+        # 4. LLAMADA A IA CON RAG (Retrieval Augmented Generation) BÁSICO
+        prompt_ia = (
+            f"DATOS DE LA COHORTE:\n"
+            f"- Total: {total_pob} pacientes.\n"
+            f"- Riesgo Alto: {counts.get('ALTO', 0)}\n"
+            f"- Riesgo Moderado: {counts.get('MODERADO', 0)}\n"
+            f"- Promedio HbA1c: {df['HBA1C'].mean():.2f}\n"
+            f"- Pacientes con Falla Renal detectada: {len(df[df['TFG'] < 60])}\n"
+        )
+        
+        res_ia = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": (
+                        "Eres un Director Médico experto en Riesgo Cardiovascular y auditoría de la Resolución 0256 de Colombia. "
+                        "Utiliza la siguiente BASE DE CONOCIMIENTO para contrastar los resultados de la cohorte y dar recomendaciones legales y clínicas:\n\n"
+                        f"### BASE DE CONOCIMIENTO NORMARTIVA:\n{conocimiento_medico}"
+                    )
+                },
+                {"role": "user", "content": prompt_ia}
+            ],
+            max_tokens=500
+        )
+
+        # 5. ESTRUCTURA DE RETORNO (Sincronizada con tu HTML)
         detalle_clinico = []
         df_criticos = df[df['RIESGO_CAT'] == "ALTO"].head(20)
-        
         for _, r in df_criticos.iterrows():
             detalle_clinico.append({
                 "nombre": f"{r.get('PRI NOMBRE', '')} {r.get('PRI APELLIDO', '')}",
                 "edad": int(r['EDAD']) if not pd.isna(r['EDAD']) else 0,
                 "riesgo": r['RIESGO_CAT'],
                 "alertas": r['ALERTAS_LIST'],
-                "sugerencia": "Ajustar terapia farmacológica y control en 15 días."
+                "sugerencia": "Priorizar cita por Medicina Interna según protocolo."
             })
 
-        # 4. LLAMADA A IA PARA INFORME EJECUTIVO
-        prompt_ia = (
-            f"Resultados Cohorte RCV: Total {total_pob} pacientes. "
-            f"Riesgo Alto: {counts.get('ALTO', 0)}, Moderado: {counts.get('MODERADO', 0)}. "
-            f"Promedio LDL: {df['LDL'].mean():.1f}. HbA1c promedio: {df['HBA1C'].mean():.1f}."
-        )
-        
-        res_ia = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Eres un Director Médico. Resume brevemente el estado de la cohorte en 2 párrafos técnicos."},
-                {"role": "user", "content": prompt_ia}
-            ],
-            max_tokens=300
-        )
-
-        # Retornamos los nombres exactos que usa tu JavaScript
         return {
             "status": "ok",
             "registros": total_pob,
