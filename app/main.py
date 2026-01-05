@@ -1,13 +1,20 @@
 import os
 import io
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# ===============================
+# CONFIGURACIÓN GENERAL
+# ===============================
 load_dotenv()
-app = FastAPI()
+
+app = FastAPI(
+    title="Atlas – Analítica Clínica Multi-Prestador",
+    version="1.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,111 +25,168 @@ app.add_middleware(
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# ===============================
+# UTILIDADES
+# ===============================
+def clean_num(df, col):
+    if col not in df.columns:
+        return pd.Series([0.0] * len(df))
+    return pd.to_numeric(
+        df[col]
+        .astype(str)
+        .str.replace(",", ".", regex=False)
+        .replace("SINDATO", None)
+        .replace("NO APLICA", None),
+        errors="coerce"
+    )
+
+def clean_text(df, col):
+    if col not in df.columns:
+        return pd.Series([""] * len(df))
+    return df[col].astype(str).str.upper().str.strip()
+
+# ===============================
+# ENDPOINT PRINCIPAL
+# ===============================
 @app.post("/analizar")
-async def analizar_archivo(file: UploadFile = File(...)):
+async def analizar_archivo(
+    file: UploadFile = File(...),
+    prestador: str | None = Query(default=None)
+):
     try:
         content = await file.read()
+
         try:
             decoded = content.decode("utf-8")
         except:
             decoded = content.decode("latin-1")
-            
-        # Leer el CSV con separador punto y coma
+
         df = pd.read_csv(io.StringIO(decoded), sep=";")
-        df.columns = [c.strip() for c in df.columns]
+        df.columns = [c.strip().upper() for c in df.columns]
 
-        # --- PROCESAMIENTO DE DATOS CLÍNICOS ---
-        
-        # Función para limpiar números (ej: '130,5' -> 130.5)
-        def clean_num(col):
-            if col in df.columns:
-                return pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
-            return pd.Series([0.0] * len(df))
+        # ===============================
+        # IDENTIFICACIÓN DEL PRESTADOR
+        # ===============================
+        if prestador:
+            nombre_prestador = prestador
+        elif "NOMBRE DE LA IPS QUE HACE SEGUIMIENTO" in df.columns:
+            nombre_prestador = df["NOMBRE DE LA IPS QUE HACE SEGUIMIENTO"].dropna().unique()[0]
+        else:
+            nombre_prestador = "PRESTADOR_DESCONOCIDO"
 
-        # Variables clave según tu estructura
-        tas_final = clean_num('ÚLTIMA TENSIÓN ARTERIAL SISTOLICA')
-        tad_final = clean_num('ÚLTIMA TENSIÓN ARTERIAL DIASTÓLICA')
-        hba1c = clean_num('REPORTE DE HEMOGLOBINA GLICOSILADA (SOLO PARA USUARIOS CON DX DE DM)')
-        tfg = clean_num('TFG fórmula Cockcroft and Gault Actual')
-        ldl = clean_num('LDL')
-        
-        # Conteos de Diagnóstico
-        tiene_hta = df['DX CONFIRMADO HTA'].str.upper().str.contains('SI', na=False).sum()
-        tiene_dm = df['DX CONFIRMADO DM'].str.upper().str.contains('SI', na=False).sum()
+        # ===============================
+        # VARIABLES CLÍNICAS CLAVE
+        # ===============================
+        tas = clean_num(df, "ÚLTIMA TENSIÓN ARTERIAL SISTOLICA")
+        tad = clean_num(df, "ÚLTIMA TENSIÓN ARTERIAL DIASTÓLICA")
+        hba1c = clean_num(df, "REPORTE DE HEMOGLOBINA GLICOSILADA (SOLO PARA USUARIOS CON DX DE DM)")
+        tfg = clean_num(df, "TFG FÓRMULA COCKCROFT AND GAULT ACTUAL")
+        ldl = clean_num(df, "LDL")
 
-        # --- LÓGICA DE RIESGO ---
+        dx_hta = clean_text(df, "DX CONFIRMADO HTA")
+        dx_dm = clean_text(df, "DX CONFIRMADO DM")
+        rcv = clean_text(df, "CLASIFICACION DEL RCV ACTUAL")
+
+        # ===============================
+        # CONTADORES GLOBALES
+        # ===============================
+        total = len(df)
+        hta_total = (dx_hta == "SI").sum()
+        dm_total = (dx_dm == "SI").sum()
+        tfg_menor_60 = (tfg < 60).sum()
+
         riesgo_alto = 0
-        riesgo_mod = 0
+        riesgo_moderado = 0
         riesgo_bajo = 0
+
         pacientes_prioritarios = []
 
+        # ===============================
+        # ANÁLISIS PACIENTE A PACIENTE
+        # ===============================
         for idx, row in df.iterrows():
             alertas = []
-            
-            # Regla 1: Descontrol Tensional (Basado en la última toma)
-            if tas_final[idx] >= 140 or tad_final[idx] >= 90:
+
+            if tas[idx] >= 140 or tad[idx] >= 90:
                 alertas.append("HTA DESCONTROLADA")
-            
-            # Regla 2: Descontrol Glucémico
-            if row['DX CONFIRMADO DM'] == 'SI' and hba1c[idx] >= 7.0:
+
+            if dx_dm[idx] == "SI" and hba1c[idx] >= 7:
                 alertas.append("DM NO CONTROLADA")
-            
-            # Regla 3: Función Renal Comprometida
+
             if 0 < tfg[idx] < 60:
-                alertas.append(f"ERC ESTADIO 3+ ({tfg[idx]})")
+                alertas.append(f"TFG BAJA ({round(tfg[idx],1)})")
 
-            # Clasificación de Riesgo para el Dashboard
-            if len(alertas) >= 2 or tfg[idx] < 30 or row['CLASIFICACION DEL RCV ACTUAL'] == 'RIESGO ALTO':
-                riesgo = "ALTO"; riesgo_alto += 1
-            elif len(alertas) == 1 or row['CLASIFICACION DEL RCV ACTUAL'] == 'RIESGO MODERADO':
-                riesgo = "MODERADO"; riesgo_mod += 1
+            if (
+                len(alertas) >= 2
+                or tfg[idx] < 30
+                or rcv[idx] == "RIESGO ALTO"
+            ):
+                riesgo = "ALTO"
+                riesgo_alto += 1
+
+            elif len(alertas) == 1 or rcv[idx] == "RIESGO MODERADO":
+                riesgo = "MODERADO"
+                riesgo_moderado += 1
+
             else:
-                riesgo = "BAJO"; riesgo_bajo += 1
+                riesgo = "BAJO"
+                riesgo_bajo += 1
 
-            # Agregar a tabla de intervención (Top 20 críticos)
-            if (riesgo == "ALTO" or riesgo == "MODERADO") and len(pacientes_prioritarios) < 20:
-                nombre_completo = f"{row['PRI NOMBRE']} {row['PRI APELLIDO']}"
+            if riesgo in ["ALTO", "MODERADO"] and len(pacientes_prioritarios) < 20:
                 pacientes_prioritarios.append({
-                    "nombre": nombre_completo,
-                    "edad": str(row['EDAD']),
+                    "identificacion": row.get("NÚMERO DE IDENTIFICACIÓN", ""),
+                    "nombre": f"{row.get('PRI NOMBRE','')} {row.get('PRI APELLIDO','')}",
+                    "edad": row.get("EDAD", ""),
+                    "sexo": row.get("SEXO", ""),
                     "riesgo": riesgo,
-                    "alertas": alertas,
-                    "sugerencia": "Revisión de terapia farmacológica urgente."
+                    "alertas": alertas
                 })
 
-        # --- RESUMEN PARA LA IA ---
-        # Calculamos los promedios antes para que la IA tenga datos reales
-        hba1c_media = hba1c[hba1c > 0].mean()
-        ldl_media = ldl[ldl > 0].mean()
-
-        informe_para_ia = f"""
-        Resultados Cohorte IPSI KANKUAMA:
-        - Total Pacientes: {len(df)}
-        - Diagnóstico HTA: {tiene_hta} pacientes.
-        - Diagnóstico DM: {tiene_dm} pacientes.
-        - Promedio HbA1c: {hba1c_media:.2f}%
-        - Promedio LDL: {ldl_media:.2f} mg/dL
-        - Pacientes con TFG < 60: {(tfg < 60).sum()}
-        
-        Analiza estos datos frente a la Resolución 0256 y da recomendaciones.
+        # ===============================
+        # RESUMEN PARA IA
+        # ===============================
+        resumen_ia = f"""
+        Prestador analizado: {nombre_prestador}
+        Total pacientes: {total}
+        HTA confirmada: {hta_total}
+        DM confirmada: {dm_total}
+        Pacientes con TFG < 60: {tfg_menor_60}
+        Riesgo Alto: {riesgo_alto}
+        Riesgo Moderado: {riesgo_moderado}
+        Riesgo Bajo: {riesgo_bajo}
+        Promedio HbA1c: {round(hba1c[hba1c>0].mean(),2)}
+        Promedio LDL: {round(ldl[ldl>0].mean(),2)}
         """
 
         response_ia = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Eres un Director Médico experto en auditoría de la Resolución 0256 en Colombia."},
-                {"role": "user", "content": informe_para_ia}
+                {
+                    "role": "system",
+                    "content": "Eres un experto en auditoría clínica y RCV en Colombia según Resolución 0256."
+                },
+                {
+                    "role": "user",
+                    "content": resumen_ia
+                }
             ]
         )
 
+        # ===============================
+        # RESPUESTA FINAL
+        # ===============================
         return {
-            "registros": len(df),
+            "prestador": nombre_prestador,
+            "total_registros": total,
             "riesgo_alto": riesgo_alto,
-            "riesgo_moderado": riesgo_mod,
+            "riesgo_moderado": riesgo_moderado,
             "riesgo_bajo": riesgo_bajo,
-            "detalle_clinico": pacientes_prioritarios,
+            "pacientes_prioritarios": pacientes_prioritarios,
             "analisis_ia": response_ia.choices[0].message.content
         }
 
     except Exception as e:
-        return {"error": f"Error procesando el CSV: {str(e)}"}
+        return {
+            "error": "Error procesando el archivo",
+            "detalle": str(e)
+        }
